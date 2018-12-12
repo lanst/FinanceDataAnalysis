@@ -18,6 +18,7 @@ from bs4 import BeautifulSoup
 from itertools import cycle
 from lxml.html import fromstring
 import json
+import csv
 
 def getCIKs():
     """ This function will get all the CIKs in a file.
@@ -362,72 +363,111 @@ def getFormLinks(docType, formLinks, links, proxy, lastProxyIndex, workingProxie
     # for link in formLinks:
     #     print(link)
 
-def extractMADFCRO(docType, sectionNeeded, formLinks, proxy, lastProxyIndex, workingProxies, pageVisited):
+def getSentimentalValue(line, totalScore, scores):
+    ''' Get the sentimental value of each word, if available.
+
+        Required:   line or sentence, totalScore, and dictionary
+                    with words and scores
+        Return:     totalScore
+    '''
+    lines = [word.strip() for word in line.split()]
+
+    if len(lines) > 0:
+        for word in lines:
+            if word.lower() in scores:
+                totalScore += scores[word.lower()]
+
+    return totalScore
+
+def extractMDAFCRO(docType, dataNeeded, formLinks, proxy, lastProxyIndex,
+                   workingProxies, pageVisited, scores):
     """ This function will extract, raw data, a section from a form, which
         is item 7 (10-K) or item 2(10-Q), Management’s Discussion and Analysis
         of Financial Condition and Results of Operations.
 
-        Required:   Links to the form, kFormLinks, qFormLinks or both
+        Required:   Links to the form (kFormLinks, qFormLinks or both)
         Return:     Item 7
     """
+    charactersToRemove = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0",
+                          ",", ".", ")", "(", "&", "!", ":", ";", "%", "$"]
+    totalScore = 0
+
     # Visit each link and get item 7 from the form.
-    for link in formLinks:
-        # print("pageVisited", str(pageVisited))
-        isConnected = False
+    for year in formLinks:
+        for link in formLinks[year]:
+            # print("pageVisited", str(pageVisited))
+            print(year, link)
+            isConnected = False
 
-        # get the content of the page
-        while not (isConnected):
-            try:
-                r = requests.get(link, proxies={"http": proxy, "https": proxy})
+            # get the content of the page
+            while not (isConnected):
+                try:
+                    r = requests.get(link, proxies={"http": proxy, "https": proxy})
 
-                if str(r.status_code) == '200':
-                    isConnected = True
-                    # print("connected")
-                else:
-                    proxy, lastProxyIndex = pickProxytoUse(lastProxyIndex, workingProxies)
+                    if str(r.status_code) == '200':
+                        isConnected = True
+                        # print("connected")
+                    else:
+                        proxy, lastProxyIndex = pickProxytoUse(lastProxyIndex,
+                                                               workingProxies)
+                        lastProxyIndex += 1
+                except Exception as e:
+                    print(e)
+                    proxy, lastProxyIndex = pickProxytoUse(lastProxyIndex,
+                                                           workingProxies)
                     lastProxyIndex += 1
-            except Exception as e:
-                print(e)
-                proxy, lastProxyIndex = pickProxytoUse(lastProxyIndex, workingProxies)
+
+            if len(dataNeeded[len(dataNeeded) - 1]) > 1:
+                dataNeeded.append([dataNeeded[len(dataNeeded) - 1][0]])
+
+            dataNeeded[len(dataNeeded) - 1].append(year)
+
+            # Using the parser to clean the content from website
+            soup = BeautifulSoup(r.content, 'html.parser')
+
+            # Get the whole forms text
+            formText = soup.getText().encode('ascii', 'ignore').decode('ascii').lower()
+
+#--------------------------------------Item7/2----------------------------------
+            # Get the section needed
+            if docType == '10-K':
+                startString = "item7."
+                endString = "item7a."
+
+            elif docType == '10-Q':
+                startString = "item2."
+                endString = "item3."
+
+            # Determine when to copy
+            copyFlag = False
+
+            for line in formText.split("\n"):
+                if endString in line.replace(" ", ""):
+                    copyFlag = False
+
+                if startString in line.replace(" ", ""):
+                    copyFlag = True
+
+                if copyFlag:
+                    # clean raw data
+                    for char in charactersToRemove:
+                        line = line.replace(char, "")
+                        totalScore = getSentimentalValue(line, totalScore, scores)
+
+            dataNeeded[len(dataNeeded) - 1].append(totalScore)
+            totalScore = 0
+            print(dataNeeded[len(dataNeeded) - 1])
+
+            pageVisited += 1
+
+            if pageVisited % 100 == 0:
+                proxy, lastProxyIndex = pickProxytoUse(lastProxyIndex,
+                                                       workingProxies)
                 lastProxyIndex += 1
-
-        # Using the parser to clean the content from website
-        soup = BeautifulSoup(r.content, 'html.parser')
-
-        # Get the whole forms text
-        formText = soup.getText().encode('ascii', 'ignore').decode('ascii').lower()
-
-        # Get the section needed
-        if docType == '10-K':
-            startString = "item7."
-            endString = "item7a."
-
-        elif docType == '10-Q':
-            startString = "item2."
-            endString = "item3."
-
-        # Dtermine when to copy
-        copyFlag = False
-
-        for line in formText.split("\n"):
-            if endString in line.replace(" ", ""):
-                copyFlag = False
-
-            if startString in line.replace(" ", ""):
-                copyFlag = True
-
-            if copyFlag:
-                sectionNeeded.append(line)
-
-        pageVisited += 1
-
-        if pageVisited % 100 == 0:
-            proxy, lastProxyIndex = pickProxytoUse(lastProxyIndex, workingProxies)
-            lastProxyIndex += 1
 
     return pageVisited, lastProxyIndex
 
-def save(CIK, links, type):
+def save(CIK, dataStructure, type):
     ''' This function will save the last known CIK and the links that was
         gathered.
 
@@ -438,15 +478,40 @@ def save(CIK, links, type):
         f = open('Data/lastKnownIndex.txt', 'w')
     elif type =='forms':
         f = open('Data/lastKnownFormIndex.txt', 'w')
-    f.write(str(CIK))
-    f.close
+    elif type == 'item7' or type == 'item2':
+        f = open('Data/lastKnownCSVIndex.txt', 'w')
 
-    if type == 'links':
+    if not (type == 'modifiedItem7' or type == 'modifiedItem2'):
+        f.write(str(CIK))
+        f.close
+
+    if type == 'item7':
+        csvFile = open('item7.csv', 'w')
+    elif type == 'item2':
+        csvFile = open('item2.csv', 'w')
+    elif type == 'modifiedItem7':
+        csvFile = open('modifiedItem7.csv', 'w')
+    elif type == 'modifiedItem2':
+        csvFile = open('modifiedItem2.csv', 'w')
+    elif type == 'links':
         f = open('Data/links.json', 'w')
     elif type =='forms':
         f = open('Data/formLinks.json', 'w')
-    json.dump(links, f)
-    f.close
+
+    if type == 'links' or type == 'forms':
+        json.dump(dataStructure, f)
+        f.close
+    else:
+        # create a header
+        header = ['CIK', 'Year', 'Sentimental Score']
+
+        # add header at the beginning
+        dataStructure = [header] + dataStructure
+
+        writer = csv.writer(csvFile)
+        writer.writerows(dataStructure)
+        csvFile.close()
+
 
 def load(type):
     ''' Get the last known CIK and all the links that was previously gathered.
@@ -459,22 +524,103 @@ def load(type):
             f = open('Data/lastKnownIndex.txt', 'r')
         elif type =='forms':
             f = open('Data/lastKnownFormIndex.txt', 'r')
+        elif type == 'item7' or type == 'item2':
+            f = open('Data/lastKnownCSVIndex.txt', 'r')
+
         lastKnownCIK = f.read()
         f.close
     except:
         lastKnownCIK = 0
 
     try:
-        if type == 'links':
+        if type == 'item7':
+            csvFile = open('item7.csv', 'r')
+        elif type == 'item2':
+            csvFile = open('item2.csv', 'r')
+        elif type == 'links':
             f = open('Data/links.json', 'r')
         elif type =='forms':
             f = open('Data/formLinks.json', 'r')
-        links = json.load(f)
-        f.close
-    except:
-        links = {}
 
-    return lastKnownCIK, links
+        if type == 'links' or type == 'forms':
+            dataStructure = json.load(f)
+            f.close
+        else:
+            reader = csv.reader(csvFile)
+            dataStructure = list(reader)
+            csvFile.close()
+
+            # remove the header
+            dataStructure.pop(0)
+    except Exception as e:
+        print(e)
+        print('No existing file exist. Do you want to continue? Press enter' +
+              ' to continue')
+        input()
+        if type == 'links' or type == 'forms':
+            dataStructure = {}
+        else:
+            dataStructure = []
+
+    return lastKnownCIK, dataStructure
+
+def getWordScores(afinnFileLocation):
+    ''' Use AFINN to determine the score of words.
+
+        Required:   AFINN file location/path
+        Return:     Dictionary with words as key and score of the word as value.
+    '''
+    scores = {}
+
+    with open(afinnFileLocation) as file:
+        #one line at a time
+        for line in file:
+            #store the word and score
+            word, score = line.split('\t')
+            scores[word] = int(score)
+        #close file
+        file.close()
+
+    return scores
+def finalCleanup(item7, item2):
+    ''' Clean up data structure by adding sentimental values of the same cik
+        and year.
+
+        Required:   item7 and item2
+        Return:     None
+    '''
+    modifiedItem7 = []
+    modifiedItem2 = []
+
+    currentItem = []
+    currentItem.append(item7[1][0])
+    currentItem.append(item7[1][1])
+    currentItem.append(item7[1][2])
+
+    for i in range(1, len(item7)):
+        if currentItem[0] == item7[i][0] and currentItem[1] == item7[i][1]:
+            currentItem[2] = int(currentItem[2]) + int(item7[i][2])
+        else:
+            if len(currentItem) == 3:
+                modifiedItem7.append(currentItem)
+            currentItem = item7[i]
+
+    save(20, modifiedItem7, 'modifiedItem7')
+
+    currentItem = []
+    currentItem.append(item2[1][0])
+    currentItem.append(item2[1][1])
+    currentItem.append(item2[1][2])
+
+    for i in range(1, len(item2)):
+        if currentItem[0] == item2[i][0] and currentItem[1] == item2[i][1]:
+            currentItem[2] = int(currentItem[2]) + int(item2[i][2])
+        else:
+            if len(currentItem) == 3:
+                modifiedItem2.append(currentItem)
+            currentItem = item2[i]
+
+    save(20, modifiedItem2, 'modifiedItem2')
 
 def main():
     cikCount        = 0
@@ -535,7 +681,7 @@ def main():
             proxy, lastProxyIndex = pickProxytoUse(lastProxyIndex, workingProxies)
             lastProxyIndex += 1
 
-        # save last known cik, every 5 ciks
+        # save, every 5 ciks
         if cikCount % 5 == 0:
             print('saving')
             save(CIK, links, 'links')
@@ -549,12 +695,17 @@ def main():
     count = 0
     cikCount = 0
 
+# ------------------------------------------------------------------------------
     # get all the links of forms
     for CIK in CIKs:
         CIK = CIK[:len(CIK)-1]
 
-        if int(CIK) < int(lastKnownFormCIK):
+        if int(CIK) <= int(lastKnownFormCIK):
             continue
+
+        # for short cut
+        # if int(CIK) >= 713002:
+        #     break
 
         formLinks['kForms'][str(CIK)] = {}
         formLinks['qForms'][str(CIK)] = {}
@@ -566,10 +717,6 @@ def main():
                                                        links['klinks'][str(CIK)],
                                                        proxy, lastProxyIndex,
                                                        workingProxies, pageVisited)
-            # print("Fetching item 7")
-            # pageVisited, lastProxyIndex = extractMADFCRO(docType, item7, formLinks['kForms'],
-            #                                              proxy, lastProxyIndex,
-            #                                              workingProxies, pageVisited)
         elif docType == '10-Q':
             print("Getting links to for the 10-Q forms")
             pageVisited, lastProxyIndex = getFormLinks(docType,
@@ -577,10 +724,6 @@ def main():
                                                        links['qlinks'][str(CIK)],
                                                        proxy, lastProxyIndex,
                                                        workingProxies, pageVisited)
-            # print("Fetching item 2")
-            # pageVisited, lastProxyIndex = extractMADFCRO(docType, item2, formLinks['qForms'],
-            #                                              proxy, lastProxyIndex,
-            #                                              workingProxies, pageVisited)
         elif docType == 'Both':
             print("Getting links for the 10-K forms")
             pageVisited, lastProxyIndex = getFormLinks('10-K',
@@ -594,14 +737,6 @@ def main():
                                                        links['qlinks'][str(CIK)],
                                                        proxy, lastProxyIndex,
                                                        workingProxies, pageVisited)
-            # print("Fetching item 7 from 10-K forms")
-            # pageVisited, lastProxyIndex = extractMADFCRO('10-K', item7, formLinks['kForms'],
-            #                                              proxy, lastProxyIndex,
-            #                                              workingProxies, pageVisited)
-            # print("Fetching item 2 from 10-Q forms")
-            # pageVisited, lastProxyIndex = extractMADFCRO('10-Q', item2, formLinks['qForms'],
-            #                                              proxy, lastProxyIndex,
-            #                                              workingProxies, pageVisited)
 
         count += 1
         cikCount += 1
@@ -611,12 +746,76 @@ def main():
             proxy, lastProxyIndex = pickProxytoUse(lastProxyIndex, workingProxies)
             lastProxyIndex += 1
 
-        # save last known cik, every 5 ciks
+        # save each loop
         if cikCount % 1 == 0:
             print('saving')
             save(CIK, formLinks, 'forms')
 
-    print(len(item2), len(item7))
+# ------------------------------------------------------------------------------
+    lastKnownCSVCIK, item7 = load('item7')
+    lastKnownCSVCIK, item2 = load('item2')
+
+    count = 0
+    cikCount = 0
+    scores = getWordScores('AFINN-111.txt')
+
+    # get all the links of forms
+    for CIK in CIKs:
+        CIK = CIK[:len(CIK)-1]
+
+        if int(CIK) <= int(lastKnownCSVCIK):
+            continue
+
+        # if int(CIK) >= 30625:
+        #     break
+
+        if docType == '10-K':
+            print("Fetching item 7")
+            item7.append([CIK])
+            pageVisited, lastProxyIndex = extractMDAFCRO(docType, item7,
+                                                formLinks['kForms'][str(CIK)],
+                                                proxy, lastProxyIndex,
+                                                workingProxies, pageVisited,
+                                                scores)
+        elif docType == '10-Q':
+            print("Fetching item 2")
+            item2.append([CIK])
+            pageVisited, lastProxyIndex = extractMDAFCRO(docType, item2,
+                                                formLinks['qForms'][str(CIK)],
+                                                proxy, lastProxyIndex,
+                                                workingProxies, pageVisited,
+                                                scores)
+        elif docType == 'Both':
+            print("Fetching item 7 from 10-K forms")
+            item7.append([CIK])
+            pageVisited, lastProxyIndex = extractMDAFCRO('10-K', item7,
+                                                 formLinks['kForms'][str(CIK)],
+                                                 proxy, lastProxyIndex,
+                                                 workingProxies, pageVisited,
+                                                 scores)
+            print("Fetching item 2 from 10-Q forms")
+            item2.append([CIK])
+            pageVisited, lastProxyIndex = extractMDAFCRO('10-Q', item2,
+                                                 formLinks['qForms'][str(CIK)],
+                                                 proxy, lastProxyIndex,
+                                                 workingProxies, pageVisited,
+                                                 scores)
+
+        count += 1
+        cikCount += 1
+
+        # Change proxy every 100 CIK
+        if count % 100 == 0:
+            proxy, lastProxyIndex = pickProxytoUse(lastProxyIndex, workingProxies)
+            lastProxyIndex += 1
+
+        # save each loop
+        if cikCount % 1 == 0:
+            print('saving')
+            save(CIK, item7, 'item7')
+            save(CIK, item2, 'item2')
+
+    finalCleanup(item7, item2)
 
 if __name__ == '__main__':
     main()
